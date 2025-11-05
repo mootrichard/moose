@@ -6,6 +6,10 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use crate::agents::extension::ExtensionInfo;
+use crate::agents::prompt_instruction::{
+    InstructionId, InstructionScope, InstructionSource, InstructionState, PromptInstruction,
+    PromptStateSnapshot,
+};
 use crate::agents::recipe_tools::dynamic_task_tools::should_enabled_subagents;
 use crate::agents::router_tools::llm_search_tool_prompt;
 use crate::{
@@ -19,8 +23,11 @@ const MAX_TOOLS: usize = 50;
 
 pub struct PromptManager {
     system_prompt_override: Option<String>,
-    system_prompt_extras: Vec<String>,
     current_date_timestamp: String,
+    instructions: HashMap<InstructionId, PromptInstruction>,
+    applied_order: Vec<InstructionId>,
+    source_index: HashMap<String, InstructionId>,
+    order_counter: u64,
 }
 
 impl Default for PromptManager {
@@ -137,7 +144,7 @@ impl<'a> SystemPromptBuilder<'a, PromptManager> {
             "You are a general-purpose AI agent called goose, created by Block".to_string()
         });
 
-        let mut system_prompt_extras = self.manager.system_prompt_extras.clone();
+        let mut system_prompt_extras = self.manager.active_instruction_texts();
         if goose_mode == GooseMode::Chat {
             system_prompt_extras.push(
                 "Right now you are in the chat only mode, no access to any tool use and system."
@@ -166,10 +173,13 @@ impl PromptManager {
     pub fn new() -> Self {
         PromptManager {
             system_prompt_override: None,
-            system_prompt_extras: Vec::new(),
             // Use the fixed current date time so that prompt cache can be used.
             // Filtering to an hour to balance user time accuracy and multi session prompt cache hits.
             current_date_timestamp: Utc::now().format("%Y-%m-%d %H:00").to_string(),
+            instructions: HashMap::new(),
+            applied_order: Vec::new(),
+            source_index: HashMap::new(),
+            order_counter: 0,
         }
     }
 
@@ -177,19 +187,139 @@ impl PromptManager {
     pub fn with_timestamp(dt: DateTime<Utc>) -> Self {
         PromptManager {
             system_prompt_override: None,
-            system_prompt_extras: Vec::new(),
             current_date_timestamp: dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+            instructions: HashMap::new(),
+            applied_order: Vec::new(),
+            source_index: HashMap::new(),
+            order_counter: 0,
         }
     }
 
     /// Add an additional instruction to the system prompt
     pub fn add_system_prompt_extra(&mut self, instruction: String) {
-        self.system_prompt_extras.push(instruction);
+        let _ = self.add_instruction_with_metadata(
+            instruction,
+            InstructionSource::Unknown,
+            InstructionScope::Session,
+        );
+    }
+
+    pub fn add_instruction_with_metadata(
+        &mut self,
+        instruction: String,
+        source: InstructionSource,
+        scope: InstructionScope,
+    ) -> InstructionId {
+        self.upsert_instruction(instruction, source, scope)
     }
 
     /// Override the system prompt with custom text
     pub fn set_system_prompt_override(&mut self, template: String) {
         self.system_prompt_override = Some(template);
+    }
+
+    pub fn instruction_stack(&self) -> Vec<&PromptInstruction> {
+        self.applied_order
+            .iter()
+            .filter_map(|id| self.instructions.get(id))
+            .filter(|instruction| instruction.state == InstructionState::Active)
+            .collect()
+    }
+
+    pub fn active_instruction_texts(&self) -> Vec<String> {
+        self.instruction_stack()
+            .into_iter()
+            .map(|instruction| instruction.content.clone())
+            .collect()
+    }
+
+    pub fn retire_instruction_by_source(
+        &mut self,
+        source: &InstructionSource,
+    ) -> Option<InstructionId> {
+        let key = source.key()?;
+        let instruction_id = self.source_index.remove(&key)?;
+        self.retire_instruction(&instruction_id)
+    }
+
+    pub fn retire_instruction(&mut self, instruction_id: &InstructionId) -> Option<InstructionId> {
+        if let Some(instruction) = self.instructions.get_mut(instruction_id) {
+            instruction.state = InstructionState::Retired;
+            instruction.updated_at = Utc::now();
+            return Some(instruction_id.clone());
+        }
+        None
+    }
+
+    pub fn get_instruction(&self, instruction_id: &InstructionId) -> Option<&PromptInstruction> {
+        self.instructions.get(instruction_id)
+    }
+
+    pub fn snapshot_state(&self) -> PromptStateSnapshot {
+        PromptStateSnapshot {
+            override_prompt: self.system_prompt_override.clone(),
+            instructions: self.instructions.values().cloned().collect(),
+            applied_order: self.applied_order.clone(),
+            current_date_timestamp: self.current_date_timestamp.clone(),
+            order_counter: self.order_counter,
+        }
+    }
+
+    pub fn restore_from_snapshot(&mut self, snapshot: PromptStateSnapshot) {
+        self.system_prompt_override = snapshot.override_prompt;
+        self.current_date_timestamp = snapshot.current_date_timestamp;
+        self.order_counter = snapshot.order_counter;
+
+        self.instructions = snapshot
+            .instructions
+            .into_iter()
+            .map(|instruction| (instruction.id.clone(), instruction))
+            .collect();
+
+        self.applied_order = snapshot.applied_order;
+        self.source_index.clear();
+
+        for instruction in self.instructions.values() {
+            if let Some(key) = instruction.source.key() {
+                self.source_index.insert(key, instruction.id.clone());
+            }
+        }
+    }
+
+    fn next_order(&mut self) -> u64 {
+        self.order_counter += 1;
+        self.order_counter
+    }
+
+    fn upsert_instruction(
+        &mut self,
+        instruction: String,
+        source: InstructionSource,
+        scope: InstructionScope,
+    ) -> InstructionId {
+        let key = source.key();
+        if let Some(existing_id) = key.as_ref().and_then(|k| self.source_index.get(k)) {
+            if let Some(existing_instruction) = self.instructions.get_mut(existing_id) {
+                existing_instruction.scope = scope;
+                existing_instruction.update_content(instruction);
+                return existing_id.clone();
+            }
+        }
+
+        let id = InstructionId::new_random();
+        let now = Utc::now();
+        let order = self.next_order();
+        let prompt_instruction =
+            PromptInstruction::new(id.clone(), source.clone(), scope, instruction, order, now);
+
+        if let Some(source_key) = key {
+            self.source_index.insert(source_key, id.clone());
+        }
+
+        self.applied_order.push(id.clone());
+        self.instructions.insert(id.clone(), prompt_instruction);
+
+        id
     }
 
     pub fn builder<'a>(&'a self, model_name: &str) -> SystemPromptBuilder<'a, Self> {

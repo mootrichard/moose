@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -13,6 +14,7 @@ use crate::agents::extension_manager::{get_parameter_names, ExtensionManager};
 use crate::agents::extension_manager_extension::MANAGE_EXTENSIONS_TOOL_NAME_COMPLETE;
 use crate::agents::final_output_tool::{FINAL_OUTPUT_CONTINUATION_MESSAGE, FINAL_OUTPUT_TOOL_NAME};
 use crate::agents::platform_tools::PLATFORM_MANAGE_SCHEDULE_TOOL_NAME;
+use crate::agents::prompt_instruction::{InstructionId, InstructionScope, InstructionSource};
 use crate::agents::prompt_manager::PromptManager;
 use crate::agents::recipe_tools::dynamic_task_tools::{
     create_dynamic_task, create_dynamic_task_tool, DYNAMIC_TASK_TOOL_NAME_PREFIX,
@@ -29,9 +31,10 @@ use crate::agents::tool_route_manager::ToolRouteManager;
 use crate::agents::tool_router_index_manager::ToolRouterIndexManager;
 use crate::agents::types::SessionConfig;
 use crate::agents::types::{FrontendTool, SharedProvider, ToolResultReceiver};
-use crate::config::{get_enabled_extensions, Config, GooseMode};
+use crate::config::{get_enabled_extensions, Config, GooseMode, PromptRefinementMode};
 use crate::context_mgmt::DEFAULT_COMPACTION_THRESHOLD;
 use crate::conversation::{debug_conversation_fix, fix_conversation, Conversation};
+use crate::logging::prompt_history::{InstructionAction, PromptHistoryWriter};
 use crate::mcp_utils::ToolResult;
 use crate::permission::permission_inspector::PermissionInspector;
 use crate::permission::permission_judge::PermissionCheckResult;
@@ -61,6 +64,7 @@ use super::tool_execution::{ToolCallResult, CHAT_MODE_TOOL_SKIPPED_RESPONSE, DEC
 use crate::agents::subagent_task_config::TaskConfig;
 use crate::conversation::message::{Message, MessageContent, SystemNotificationType, ToolRequest};
 use crate::session::extension_data::{EnabledExtensionsState, ExtensionState};
+use crate::session::prompt_state::PromptStateStore;
 use crate::session::{Session, SessionManager};
 
 const DEFAULT_MAX_TURNS: u32 = 1000;
@@ -81,6 +85,12 @@ pub struct ToolCategorizeResult {
     pub frontend_requests: Vec<ToolRequest>,
     pub remaining_requests: Vec<ToolRequest>,
     pub filtered_response: Message,
+}
+
+struct PromptPersistenceContext {
+    project_path: PathBuf,
+    session_id: String,
+    history_writer: Arc<PromptHistoryWriter>,
 }
 
 /// The main goose Agent
@@ -104,6 +114,7 @@ pub struct Agent {
     pub(super) retry_manager: RetryManager,
     pub(super) tool_inspection_manager: ToolInspectionManager,
     pub(super) autopilot: Mutex<AutoPilot>,
+    prompt_persistence: Mutex<Option<PromptPersistenceContext>>,
 }
 
 #[derive(Clone, Debug)]
@@ -179,6 +190,7 @@ impl Agent {
             retry_manager: RetryManager::new(),
             tool_inspection_manager: Self::create_default_tool_inspection_manager(),
             autopilot: Mutex::new(AutoPilot::new()),
+            prompt_persistence: Mutex::new(None),
         }
     }
 
@@ -1191,8 +1203,27 @@ impl Agent {
     }
 
     pub async fn extend_system_prompt(&self, instruction: String) {
-        let mut prompt_manager = self.prompt_manager.lock().await;
-        prompt_manager.add_system_prompt_extra(instruction);
+        self.extend_system_prompt_with_source(
+            instruction,
+            InstructionSource::Unknown,
+            InstructionScope::Session,
+        )
+        .await;
+    }
+
+    pub async fn extend_system_prompt_with_source(
+        &self,
+        instruction: String,
+        source: InstructionSource,
+        scope: InstructionScope,
+    ) {
+        let instruction_id = {
+            let mut prompt_manager = self.prompt_manager.lock().await;
+            prompt_manager.add_instruction_with_metadata(instruction, source, scope)
+        };
+        self.log_instruction_event(InstructionAction::Apply, instruction_id)
+            .await;
+        self.persist_snapshot().await;
     }
 
     pub async fn update_provider(&self, provider: Arc<dyn Provider>) -> Result<()> {
@@ -1222,8 +1253,112 @@ impl Agent {
 
     /// Override the system prompt with a custom template
     pub async fn override_system_prompt(&self, template: String) {
-        let mut prompt_manager = self.prompt_manager.lock().await;
-        prompt_manager.set_system_prompt_override(template);
+        {
+            let mut prompt_manager = self.prompt_manager.lock().await;
+            prompt_manager.set_system_prompt_override(template);
+        }
+        self.persist_snapshot().await;
+    }
+
+    pub async fn configure_prompt_persistence(
+        &self,
+        project_path: PathBuf,
+        session_id: String,
+        mode: PromptRefinementMode,
+    ) -> Result<()> {
+        if matches!(mode, PromptRefinementMode::Disabled) {
+            return Ok(());
+        }
+
+        if matches!(mode, PromptRefinementMode::Enabled) {
+            match PromptStateStore::load(&project_path, &session_id) {
+                Ok(Some(snapshot)) => {
+                    let mut prompt_manager = self.prompt_manager.lock().await;
+                    prompt_manager.restore_from_snapshot(snapshot);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(
+                        "Failed to load prompt snapshot for session {}: {}",
+                        session_id, err
+                    );
+                }
+            }
+        }
+
+        match PromptHistoryWriter::new(&project_path, &session_id) {
+            Ok(writer) => {
+                let mut persistence = self.prompt_persistence.lock().await;
+                *persistence = Some(PromptPersistenceContext {
+                    project_path,
+                    session_id,
+                    history_writer: Arc::new(writer),
+                });
+            }
+            Err(err) => {
+                warn!("Failed to initialize prompt history writer: {}", err);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn persist_snapshot(&self) {
+        let (project_path, session_id) = {
+            let persistence_guard = self.prompt_persistence.lock().await;
+            if let Some(context) = persistence_guard.as_ref() {
+                (context.project_path.clone(), context.session_id.clone())
+            } else {
+                return;
+            }
+        };
+
+        let snapshot = {
+            let manager = self.prompt_manager.lock().await;
+            manager.snapshot_state()
+        };
+
+        if let Err(err) = PromptStateStore::save(&snapshot, &project_path, &session_id) {
+            warn!(
+                "Failed to persist prompt snapshot for session {}: {}",
+                session_id, err
+            );
+        }
+    }
+
+    async fn log_instruction_event(
+        &self,
+        action: InstructionAction,
+        instruction_id: InstructionId,
+    ) {
+        let writer = {
+            let persistence_guard = self.prompt_persistence.lock().await;
+            persistence_guard
+                .as_ref()
+                .map(|context| context.history_writer.clone())
+        };
+
+        let Some(writer) = writer else {
+            return;
+        };
+
+        let instruction = {
+            let manager = self.prompt_manager.lock().await;
+            manager.get_instruction(&instruction_id).cloned()
+        };
+
+        if let Some(instruction) = instruction {
+            if let Err(err) = writer.record_instruction(
+                action,
+                instruction.id.as_str(),
+                &instruction.source,
+                &instruction.scope,
+                &instruction.content,
+                instruction.order,
+            ) {
+                warn!("Failed to write prompt history entry: {}", err);
+            }
+        }
     }
 
     pub async fn list_extension_prompts(&self) -> HashMap<String, Vec<Prompt>> {

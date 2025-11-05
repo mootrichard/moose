@@ -9,6 +9,7 @@ mod large_response_handler;
 pub mod mcp_client;
 pub mod model_selector;
 pub mod platform_tools;
+pub mod prompt_instruction;
 pub mod prompt_manager;
 pub mod recipe_tools;
 mod reply_parts;
@@ -29,6 +30,9 @@ pub mod types;
 pub use agent::{Agent, AgentEvent, MANUAL_COMPACT_TRIGGER};
 pub use extension::ExtensionConfig;
 pub use extension_manager::ExtensionManager;
+pub use prompt_instruction::{
+    InstructionId, InstructionScope, InstructionSource, InstructionState, PromptInstruction,
+};
 pub use prompt_manager::PromptManager;
 pub use subagent_task_config::TaskConfig;
 pub use types::{FrontendTool, RetryConfig, SessionConfig, SuccessCheck};

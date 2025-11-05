@@ -1,3 +1,5 @@
+pub mod prompt_history;
+
 use crate::config::paths::Paths;
 use anyhow::{Context, Result};
 use std::fs;

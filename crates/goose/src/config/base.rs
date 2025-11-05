@@ -1,5 +1,5 @@
 use crate::config::paths::Paths;
-use crate::config::GooseMode;
+use crate::config::{GooseMode, PromptRefinementMode};
 use fs2::FileExt;
 use keyring::Entry;
 use once_cell::sync::OnceCell;
@@ -11,6 +11,7 @@ use std::env;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Mutex;
 use thiserror::Error;
 
@@ -199,6 +200,13 @@ impl Config {
 
     pub fn exists(&self) -> bool {
         self.config_path.exists()
+    }
+
+    pub fn prompt_refinement_mode(&self) -> PromptRefinementMode {
+        self.get_param::<String>("goose_prompt_refinement")
+            .ok()
+            .and_then(|value| PromptRefinementMode::from_str(value.as_str()).ok())
+            .unwrap_or(PromptRefinementMode::Disabled)
     }
 
     pub fn clear(&self) -> Result<(), ConfigError> {

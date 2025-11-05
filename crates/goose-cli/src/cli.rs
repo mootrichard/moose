@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
-use goose::config::{Config, ExtensionConfig};
+use goose::config::{Config, ExtensionConfig, PromptRefinementMode};
 
 use crate::commands::acp::run_acp_agent;
 use crate::commands::bench::agent_generator;
@@ -513,6 +513,16 @@ enum Command {
             value_delimiter = ','
         )]
         builtins: Vec<String>,
+
+        /// Override prompt refinement mode for this session
+        #[arg(
+            long = "prompt-refinement",
+            value_name = "MODE",
+            value_enum,
+            help = "Set prompt refinement mode (disabled, persist-only, enabled)",
+            long_help = "Override the prompt refinement mode for this session. Use 'disabled', 'persist-only', or 'enabled'."
+        )]
+        prompt_refinement: Option<PromptRefinementCliMode>,
     },
 
     /// Open the last project directory
@@ -824,6 +834,23 @@ enum CliProviderVariant {
     Ollama,
 }
 
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum PromptRefinementCliMode {
+    Disabled,
+    PersistOnly,
+    Enabled,
+}
+
+impl From<PromptRefinementCliMode> for PromptRefinementMode {
+    fn from(value: PromptRefinementCliMode) -> Self {
+        match value {
+            PromptRefinementCliMode::Disabled => PromptRefinementMode::Disabled,
+            PromptRefinementCliMode::PersistOnly => PromptRefinementMode::PersistOnly,
+            PromptRefinementCliMode::Enabled => PromptRefinementMode::Enabled,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct InputConfig {
     pub contents: Option<String>,
@@ -895,6 +922,7 @@ pub async fn cli() -> anyhow::Result<()> {
             remote_extensions,
             streamable_http_extensions,
             builtins,
+            prompt_refinement,
         }) => {
             return match command {
                 Some(SessionCommand::List {
@@ -985,6 +1013,7 @@ pub async fn cli() -> anyhow::Result<()> {
                         final_output_response: None,
                         retry_config: None,
                         output_format: "text".to_string(),
+                        prompt_refinement_mode: prompt_refinement.map(Into::into),
                     })
                     .await;
 
@@ -1196,6 +1225,7 @@ pub async fn cli() -> anyhow::Result<()> {
                     .and_then(|r| r.final_output_response.clone()),
                 retry_config: recipe_info.as_ref().and_then(|r| r.retry_config.clone()),
                 output_format,
+                prompt_refinement_mode: None,
             })
             .await;
 
@@ -1380,6 +1410,7 @@ pub async fn cli() -> anyhow::Result<()> {
                     final_output_response: None,
                     retry_config: None,
                     output_format: "text".to_string(),
+                    prompt_refinement_mode: None,
                 })
                 .await;
                 session.interactive(None).await?;

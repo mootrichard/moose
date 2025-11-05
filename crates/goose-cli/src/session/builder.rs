@@ -5,7 +5,7 @@ use goose::agents::types::{RetryConfig, SessionConfig};
 use goose::agents::Agent;
 use goose::config::{
     extensions::{get_extension_by_name, set_extension, ExtensionEntry},
-    get_all_extensions, get_enabled_extensions, Config, ExtensionConfig,
+    get_all_extensions, get_enabled_extensions, Config, ExtensionConfig, PromptRefinementMode,
 };
 use goose::providers::create;
 use goose::recipe::{Response, SubRecipe};
@@ -70,6 +70,8 @@ pub struct SessionBuilderConfig {
     pub retry_config: Option<RetryConfig>,
     /// Output format (text, json)
     pub output_format: String,
+    /// Optional prompt refinement mode override for this session
+    pub prompt_refinement_mode: Option<PromptRefinementMode>,
 }
 
 /// Manual implementation of Default to ensure proper initialization of output_format
@@ -99,6 +101,7 @@ impl Default for SessionBuilderConfig {
             final_output_response: None,
             retry_config: None,
             output_format: "text".to_string(),
+            prompt_refinement_mode: None,
         }
     }
 }
@@ -249,6 +252,10 @@ pub async fn build_session(session_config: SessionBuilderConfig) -> CliSession {
     // Load config and get provider/model
     let config = Config::global();
 
+    let prompt_refinement_mode = session_config
+        .prompt_refinement_mode
+        .unwrap_or_else(|| config.prompt_refinement_mode());
+
     let provider_name = session_config
         .provider
         .or_else(|| {
@@ -361,6 +368,30 @@ pub async fn build_session(session_config: SessionBuilderConfig) -> CliSession {
     } else {
         session_config.session_id.unwrap()
     };
+
+    if !matches!(prompt_refinement_mode, PromptRefinementMode::Disabled) {
+        let session_project_path = SessionManager::get_session(&session_id, false)
+            .await
+            .map(|session| session.working_dir)
+            .unwrap_or_else(|err| {
+                tracing::warn!(
+                    "Failed to fetch session metadata for prompt persistence: {}",
+                    err
+                );
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+            });
+
+        if let Err(err) = agent
+            .configure_prompt_persistence(
+                session_project_path,
+                session_id.clone(),
+                prompt_refinement_mode,
+            )
+            .await
+        {
+            tracing::warn!("Prompt persistence disabled: {}", err);
+        }
+    }
 
     agent
         .extension_manager
@@ -655,6 +686,10 @@ pub async fn build_session(session_config: SessionBuilderConfig) -> CliSession {
             Some(&provider_for_display),
         );
     }
+    tracing::info!(
+        "Prompt refinement mode: {}",
+        prompt_refinement_mode.as_str()
+    );
     session
 }
 
@@ -687,6 +722,7 @@ mod tests {
             final_output_response: None,
             retry_config: None,
             output_format: "text".to_string(),
+            prompt_refinement_mode: None,
         };
 
         assert_eq!(config.extensions.len(), 1);
